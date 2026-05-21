@@ -1,5 +1,9 @@
 import { useState, useRef, useEffect } from "react";
 
+// Бесплатный AI без ключа — Pollinations.ai (OpenAI-совместимый endpoint, анонимный доступ, SSE-стриминг).
+const API_URL = "https://text.pollinations.ai/openai";
+const MODEL = "openai-fast";
+
 const SYSTEM_PROMPT = `Ты — Xwin Pro, продвинутый AI-ассистент нового поколения. Ты умный, полезный, дружелюбный и точный.
 Отвечай на русском языке если вопрос на русском. Будь конкретным и полезным.
 Если тебя спрашивают о твоей модели или имени — ты Xwin Pro, мощный интеллектуальный ассистент.
@@ -149,12 +153,24 @@ const quickPrompts = [
 
 // ─── Main component ───────────────────────────────────────────────
 export default function XwinAI() {
-  const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [isTyping, setIsTyping] = useState(false);
-  const [history, setHistory] = useState([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [sessions, setSessions] = useState([{ id: 1, title: "Новый чат", active: true }]);
+  const [sessions, setSessions] = useState([{ id: 1, title: "Новый чат", active: true, messages: [], history: [] }]);
+
+  // Сообщения и история лежат внутри активной сессии, чтобы переключение чатов работало
+  const activeSession = sessions.find(s => s.active) ?? sessions[0];
+  const messages = activeSession?.messages ?? [];
+  const history = activeSession?.history ?? [];
+  const updateActiveSession = (patch) => {
+    setSessions(prev => prev.map(s => s.active ? { ...s, ...patch(s) } : s));
+  };
+  const setMessages = (updater) => updateActiveSession(s => ({
+    messages: typeof updater === "function" ? updater(s.messages) : updater
+  }));
+  const setHistory = (updater) => updateActiveSession(s => ({
+    history: typeof updater === "function" ? updater(s.history) : updater
+  }));
   const [attachedFile, setAttachedFile] = useState(null);
   const [dragOver, setDragOver] = useState(false);
   const anchorRef = useRef(null);
@@ -227,25 +243,17 @@ export default function XwinAI() {
   const buildUserContent = (text, file) => {
     if (!file) return text || "";
 
-    // Изображение — передаём как base64 image
-    if (file.type.startsWith("image/")) {
-      const content = [];
-      content.push({ type: "image", source: { type: "base64", media_type: file.mediaType, data: file.base64 } });
-      content.push({ type: "text", text: text || "Опиши что на изображении подробно" });
-      return content;
+    // Изображение / PDF — модель не поддерживает vision, упоминаем файл текстом
+    if (file.type.startsWith("image/") || file.type === "application/pdf") {
+      const note = `[Прикреплён файл: ${file.name} (${formatFileSize(file.size)})]`;
+      return text ? `${text}\n\n${note}` : note;
     }
 
-    // PDF — передаём как document
-    if (file.type === "application/pdf") {
-      const content = [];
-      content.push({ type: "document", source: { type: "base64", media_type: "application/pdf", data: file.base64 } });
-      content.push({ type: "text", text: text || "Проанализируй этот документ подробно" });
-      return content;
-    }
-
-    // Текстовые файлы и код — декодируем и вставляем в сообщение
+    // Текстовые файлы и код — декодируем UTF-8 и вставляем в сообщение
     try {
-      const decoded = atob(file.base64);
+      // atob + TextDecoder, чтобы корректно декодировать UTF-8 (кириллица и т.п.)
+      const bytes = Uint8Array.from(atob(file.base64), c => c.charCodeAt(0));
+      const decoded = new TextDecoder("utf-8").decode(bytes);
       const ext = file.name.split(".").pop()?.toLowerCase() || "";
       const langMap = {
         js: "javascript", jsx: "jsx", ts: "typescript", tsx: "tsx",
@@ -282,25 +290,23 @@ export default function XwinAI() {
     setIsTyping(true);
 
     // Добавляем пустое сообщение AI которое будем наполнять стримом
-    setMessages(prev => [...prev, { role: "ai", text: "", streaming: true }]);
+    setMessages(prev => [...prev, { role: "ai", text: "", reasoning: "", streaming: true }]);
 
     const controller = new AbortController();
     abortRef.current = controller;
 
     try {
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
+      const response = await fetch(API_URL, {
         method: "POST",
         signal: controller.signal,
-        headers: {
-          "Content-Type": "application/json",
-          "anthropic-version": "2023-06-01",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          model: "claude-sonnet-4-20250514",
-          max_tokens: 8000,
+          model: MODEL,
           stream: true,
-          system: SYSTEM_PROMPT,
-          messages: newHistory
+          messages: [
+            { role: "system", content: SYSTEM_PROMPT },
+            ...newHistory
+          ]
         })
       });
 
@@ -312,6 +318,7 @@ export default function XwinAI() {
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let fullReply = "";
+      let fullReasoning = "";
       let buffer = "";
 
       while (true) {
@@ -328,8 +335,23 @@ export default function XwinAI() {
           if (data === "[DONE]") continue;
           try {
             const parsed = JSON.parse(data);
-            if (parsed.type === "content_block_delta" && parsed.delta?.type === "text_delta") {
-              fullReply += parsed.delta.text;
+            const delta = parsed.choices?.[0]?.delta || {};
+            // Reasoning-модели (типа openai-fast / gpt-oss-20b) сначала стримят размышления в delta.reasoning,
+            // и только потом — финальный ответ в delta.content.
+            if (typeof delta.reasoning === "string" && delta.reasoning) {
+              fullReasoning += delta.reasoning;
+              const snapshot = fullReasoning;
+              setMessages(prev => {
+                const updated = [...prev];
+                const lastIdx = updated.length - 1;
+                if (updated[lastIdx]?.role === "ai") {
+                  updated[lastIdx] = { ...updated[lastIdx], reasoning: snapshot };
+                }
+                return updated;
+              });
+            }
+            if (typeof delta.content === "string" && delta.content) {
+              fullReply += delta.content;
               const snapshot = fullReply;
               setMessages(prev => {
                 const updated = [...prev];
@@ -344,12 +366,16 @@ export default function XwinAI() {
         }
       }
 
-      // Финализируем сообщение (убираем флаг streaming)
+      // Финализируем сообщение (убираем флаг streaming, сохраняем reasoning)
       setMessages(prev => {
         const updated = [...prev];
         const lastIdx = updated.length - 1;
         if (updated[lastIdx]?.role === "ai") {
-          updated[lastIdx] = { role: "ai", text: fullReply || "Нет ответа." };
+          updated[lastIdx] = {
+            role: "ai",
+            text: fullReply || (fullReasoning ? "" : "Нет ответа."),
+            reasoning: fullReasoning
+          };
         }
         return updated;
       });
@@ -357,8 +383,7 @@ export default function XwinAI() {
       setHistory(h => [...h, { role: "assistant", content: fullReply }]);
 
       if (newHistory.length === 1) {
-        const title = (typeof userContent === "string" ? userContent : msg || currentFile?.name || "Файл")
-          .slice(0, 28);
+        const title = (msg || currentFile?.name || "Файл").slice(0, 28);
         setSessions(s => s.map(sess => sess.active ? { ...sess, title: title + (title.length >= 28 ? "…" : "") } : sess));
       }
     } catch (err) {
@@ -392,9 +417,21 @@ export default function XwinAI() {
 
   const clearChat = () => {
     abortRef.current?.abort();
-    setMessages([]); setHistory([]); setAttachedFile(null);
+    setAttachedFile(null);
+    setIsTyping(false);
     const newId = Date.now();
-    setSessions(prev => [...prev.map(s => ({ ...s, active: false })), { id: newId, title: "Новый чат", active: true }]);
+    setSessions(prev => [
+      ...prev.map(s => ({ ...s, active: false })),
+      { id: newId, title: "Новый чат", active: true, messages: [], history: [] }
+    ]);
+  };
+
+  const switchSession = (id) => {
+    if (sessions.find(s => s.id === id)?.active) return;
+    abortRef.current?.abort();
+    setAttachedFile(null);
+    setIsTyping(false);
+    setSessions(prev => prev.map(s => ({ ...s, active: s.id === id })));
   };
 
   const handleKey = (e) => {
@@ -471,7 +508,7 @@ export default function XwinAI() {
           </button>
           <div style={{ marginTop: 12, flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: 4 }}>
             {sessions.slice().reverse().map(sess => (
-              <div key={sess.id} className={`sess-item${sess.active ? " active" : ""}`} style={{ padding: "9px 12px", borderRadius: 9, fontSize: 12, color: sess.active ? "#a0c4ff" : "#445577", cursor: "pointer", transition: "all 0.15s", borderLeft: "2px solid transparent", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+              <div key={sess.id} onClick={() => switchSession(sess.id)} className={`sess-item${sess.active ? " active" : ""}`} style={{ padding: "9px 12px", borderRadius: 9, fontSize: 12, color: sess.active ? "#a0c4ff" : "#445577", cursor: "pointer", transition: "all 0.15s", borderLeft: "2px solid transparent", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                 💬 {sess.title}
               </div>
             ))}
@@ -549,12 +586,22 @@ export default function XwinAI() {
               </div>
               <div style={{ maxWidth: "78%", padding: "13px 17px", borderRadius: m.role === "ai" ? "18px 18px 18px 4px" : "18px 18px 4px 18px", fontSize: 14, lineHeight: 1.65, ...(m.role === "ai" ? { background: "#0e0e1e", border: "1px solid rgba(0,100,255,0.12)", color: "#cdd8f0" } : { background: "linear-gradient(135deg,#0044cc,#0088ff)", color: "#fff", boxShadow: "0 4px 24px rgba(0,100,255,0.3)" }) }}>
                 {m.file && <FilePreview file={m.file} />}
-                {m.role === "ai" && m.streaming && m.text === "" ? (
+                {m.role === "ai" && m.streaming && !m.text && !m.reasoning ? (
                   <TypingDots />
                 ) : (
-                  <div className={m.streaming ? "stream-cursor" : ""}>
-                    <BubbleContent text={m.text} />
-                  </div>
+                  <>
+                    {m.role === "ai" && m.reasoning ? (
+                      <details open={!m.text} style={{ marginBottom: m.text ? 10 : 0, opacity: 0.72 }}>
+                        <summary style={{ cursor: "pointer", fontSize: 12, color: "#7e8fb8", userSelect: "none", listStyle: "none" }}>🧠 Размышления</summary>
+                        <div style={{ marginTop: 8, padding: "10px 12px", borderLeft: "2px solid rgba(0,100,255,0.25)", background: "rgba(0,30,80,0.18)", borderRadius: 6, fontSize: 12.5, lineHeight: 1.55, color: "#9aaad0", whiteSpace: "pre-wrap" }}>{m.reasoning}</div>
+                      </details>
+                    ) : null}
+                    {m.text || !m.streaming ? (
+                      <div className={m.streaming ? "stream-cursor" : ""}>
+                        <BubbleContent text={m.text} />
+                      </div>
+                    ) : null}
+                  </>
                 )}
               </div>
             </div>
