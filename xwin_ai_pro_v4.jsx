@@ -1,13 +1,13 @@
 import { useState, useRef, useEffect } from "react";
 
-// API key sourced from build-time env. Vite by default — for Next.js use
-// NEXT_PUBLIC_ANTHROPIC_API_KEY (or React App's REACT_APP_…) and adjust below.
-// SECURITY: shipping the key in the client bundle exposes it to anyone who opens
-// DevTools. For production, proxy requests through your own backend instead.
-const API_KEY = (() => {
-  try { if (import.meta?.env?.VITE_ANTHROPIC_API_KEY) return import.meta.env.VITE_ANTHROPIC_API_KEY; } catch {}
-  try { if (typeof process !== "undefined" && process.env) return process.env.NEXT_PUBLIC_ANTHROPIC_API_KEY || process.env.REACT_APP_ANTHROPIC_API_KEY || ""; } catch {}
-  return "";
+// Фронтенд НЕ хранит ключ Anthropic. Он ходит на ваш бэкенд-прокси, а прокси уже
+// добавляет x-api-key и ретранслирует запрос на https://api.anthropic.com/v1/messages.
+// Пример прокси лежит в server/proxy.example.mjs.
+// URL прокси настраивается через env, по умолчанию "/api/chat" (same-origin, удобно для Next.js).
+const PROXY_URL = (() => {
+  try { if (import.meta?.env?.VITE_CHAT_PROXY_URL) return import.meta.env.VITE_CHAT_PROXY_URL; } catch {}
+  try { if (typeof process !== "undefined" && process.env) return process.env.NEXT_PUBLIC_CHAT_PROXY_URL || process.env.REACT_APP_CHAT_PROXY_URL || "/api/chat"; } catch {}
+  return "/api/chat";
 })();
 
 const SYSTEM_PROMPT = `Ты — Xwin Pro, продвинутый AI-ассистент нового поколения. Ты умный, полезный, дружелюбный и точный.
@@ -312,17 +312,11 @@ export default function XwinAI() {
     abortRef.current = controller;
 
     try {
-      if (!API_KEY) {
-        throw new Error("Не задан Anthropic API ключ (VITE_ANTHROPIC_API_KEY).");
-      }
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
+      const response = await fetch(PROXY_URL, {
         method: "POST",
         signal: controller.signal,
         headers: {
           "Content-Type": "application/json",
-          "anthropic-version": "2023-06-01",
-          "x-api-key": API_KEY,
-          "anthropic-dangerous-direct-browser-access": "true",
         },
         body: JSON.stringify({
           model: "claude-sonnet-4-20250514",
