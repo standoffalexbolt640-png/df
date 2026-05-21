@@ -290,7 +290,7 @@ export default function XwinAI() {
     setIsTyping(true);
 
     // Добавляем пустое сообщение AI которое будем наполнять стримом
-    setMessages(prev => [...prev, { role: "ai", text: "", streaming: true }]);
+    setMessages(prev => [...prev, { role: "ai", text: "", reasoning: "", streaming: true }]);
 
     const controller = new AbortController();
     abortRef.current = controller;
@@ -318,6 +318,7 @@ export default function XwinAI() {
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let fullReply = "";
+      let fullReasoning = "";
       let buffer = "";
 
       while (true) {
@@ -334,9 +335,23 @@ export default function XwinAI() {
           if (data === "[DONE]") continue;
           try {
             const parsed = JSON.parse(data);
-            const delta = parsed.choices?.[0]?.delta?.content;
-            if (typeof delta === "string" && delta) {
-              fullReply += delta;
+            const delta = parsed.choices?.[0]?.delta || {};
+            // Reasoning-модели (типа openai-fast / gpt-oss-20b) сначала стримят размышления в delta.reasoning,
+            // и только потом — финальный ответ в delta.content.
+            if (typeof delta.reasoning === "string" && delta.reasoning) {
+              fullReasoning += delta.reasoning;
+              const snapshot = fullReasoning;
+              setMessages(prev => {
+                const updated = [...prev];
+                const lastIdx = updated.length - 1;
+                if (updated[lastIdx]?.role === "ai") {
+                  updated[lastIdx] = { ...updated[lastIdx], reasoning: snapshot };
+                }
+                return updated;
+              });
+            }
+            if (typeof delta.content === "string" && delta.content) {
+              fullReply += delta.content;
               const snapshot = fullReply;
               setMessages(prev => {
                 const updated = [...prev];
@@ -351,12 +366,16 @@ export default function XwinAI() {
         }
       }
 
-      // Финализируем сообщение (убираем флаг streaming)
+      // Финализируем сообщение (убираем флаг streaming, сохраняем reasoning)
       setMessages(prev => {
         const updated = [...prev];
         const lastIdx = updated.length - 1;
         if (updated[lastIdx]?.role === "ai") {
-          updated[lastIdx] = { role: "ai", text: fullReply || "Нет ответа." };
+          updated[lastIdx] = {
+            role: "ai",
+            text: fullReply || (fullReasoning ? "" : "Нет ответа."),
+            reasoning: fullReasoning
+          };
         }
         return updated;
       });
@@ -567,12 +586,22 @@ export default function XwinAI() {
               </div>
               <div style={{ maxWidth: "78%", padding: "13px 17px", borderRadius: m.role === "ai" ? "18px 18px 18px 4px" : "18px 18px 4px 18px", fontSize: 14, lineHeight: 1.65, ...(m.role === "ai" ? { background: "#0e0e1e", border: "1px solid rgba(0,100,255,0.12)", color: "#cdd8f0" } : { background: "linear-gradient(135deg,#0044cc,#0088ff)", color: "#fff", boxShadow: "0 4px 24px rgba(0,100,255,0.3)" }) }}>
                 {m.file && <FilePreview file={m.file} />}
-                {m.role === "ai" && m.streaming && m.text === "" ? (
+                {m.role === "ai" && m.streaming && !m.text && !m.reasoning ? (
                   <TypingDots />
                 ) : (
-                  <div className={m.streaming ? "stream-cursor" : ""}>
-                    <BubbleContent text={m.text} />
-                  </div>
+                  <>
+                    {m.role === "ai" && m.reasoning ? (
+                      <details open={!m.text} style={{ marginBottom: m.text ? 10 : 0, opacity: 0.72 }}>
+                        <summary style={{ cursor: "pointer", fontSize: 12, color: "#7e8fb8", userSelect: "none", listStyle: "none" }}>🧠 Размышления</summary>
+                        <div style={{ marginTop: 8, padding: "10px 12px", borderLeft: "2px solid rgba(0,100,255,0.25)", background: "rgba(0,30,80,0.18)", borderRadius: 6, fontSize: 12.5, lineHeight: 1.55, color: "#9aaad0", whiteSpace: "pre-wrap" }}>{m.reasoning}</div>
+                      </details>
+                    ) : null}
+                    {m.text || !m.streaming ? (
+                      <div className={m.streaming ? "stream-cursor" : ""}>
+                        <BubbleContent text={m.text} />
+                      </div>
+                    ) : null}
+                  </>
                 )}
               </div>
             </div>
