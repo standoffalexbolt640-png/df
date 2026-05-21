@@ -1,5 +1,15 @@
 import { useState, useRef, useEffect } from "react";
 
+// API key sourced from build-time env. Vite by default — for Next.js use
+// NEXT_PUBLIC_ANTHROPIC_API_KEY (or React App's REACT_APP_…) and adjust below.
+// SECURITY: shipping the key in the client bundle exposes it to anyone who opens
+// DevTools. For production, proxy requests through your own backend instead.
+const API_KEY = (() => {
+  try { if (import.meta?.env?.VITE_ANTHROPIC_API_KEY) return import.meta.env.VITE_ANTHROPIC_API_KEY; } catch {}
+  try { if (typeof process !== "undefined" && process.env) return process.env.NEXT_PUBLIC_ANTHROPIC_API_KEY || process.env.REACT_APP_ANTHROPIC_API_KEY || ""; } catch {}
+  return "";
+})();
+
 const SYSTEM_PROMPT = `Ты — Xwin Pro, продвинутый AI-ассистент нового поколения. Ты умный, полезный, дружелюбный и точный.
 Отвечай на русском языке если вопрос на русском. Будь конкретным и полезным.
 Если тебя спрашивают о твоей модели или имени — ты Xwin Pro, мощный интеллектуальный ассистент.
@@ -149,12 +159,24 @@ const quickPrompts = [
 
 // ─── Main component ───────────────────────────────────────────────
 export default function XwinAI() {
-  const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [isTyping, setIsTyping] = useState(false);
-  const [history, setHistory] = useState([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [sessions, setSessions] = useState([{ id: 1, title: "Новый чат", active: true }]);
+  const [sessions, setSessions] = useState([{ id: 1, title: "Новый чат", active: true, messages: [], history: [] }]);
+
+  // Сообщения и история лежат внутри активной сессии, чтобы переключение чатов работало
+  const activeSession = sessions.find(s => s.active) ?? sessions[0];
+  const messages = activeSession?.messages ?? [];
+  const history = activeSession?.history ?? [];
+  const updateActiveSession = (patch) => {
+    setSessions(prev => prev.map(s => s.active ? { ...s, ...patch(s) } : s));
+  };
+  const setMessages = (updater) => updateActiveSession(s => ({
+    messages: typeof updater === "function" ? updater(s.messages) : updater
+  }));
+  const setHistory = (updater) => updateActiveSession(s => ({
+    history: typeof updater === "function" ? updater(s.history) : updater
+  }));
   const [attachedFile, setAttachedFile] = useState(null);
   const [dragOver, setDragOver] = useState(false);
   const anchorRef = useRef(null);
@@ -245,7 +267,9 @@ export default function XwinAI() {
 
     // Текстовые файлы и код — декодируем и вставляем в сообщение
     try {
-      const decoded = atob(file.base64);
+      // atob + TextDecoder, чтобы корректно декодировать UTF-8 (кириллица и т.п.)
+      const bytes = Uint8Array.from(atob(file.base64), c => c.charCodeAt(0));
+      const decoded = new TextDecoder("utf-8").decode(bytes);
       const ext = file.name.split(".").pop()?.toLowerCase() || "";
       const langMap = {
         js: "javascript", jsx: "jsx", ts: "typescript", tsx: "tsx",
@@ -288,12 +312,17 @@ export default function XwinAI() {
     abortRef.current = controller;
 
     try {
+      if (!API_KEY) {
+        throw new Error("Не задан Anthropic API ключ (VITE_ANTHROPIC_API_KEY).");
+      }
       const response = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
         signal: controller.signal,
         headers: {
           "Content-Type": "application/json",
           "anthropic-version": "2023-06-01",
+          "x-api-key": API_KEY,
+          "anthropic-dangerous-direct-browser-access": "true",
         },
         body: JSON.stringify({
           model: "claude-sonnet-4-20250514",
@@ -392,9 +421,21 @@ export default function XwinAI() {
 
   const clearChat = () => {
     abortRef.current?.abort();
-    setMessages([]); setHistory([]); setAttachedFile(null);
+    setAttachedFile(null);
+    setIsTyping(false);
     const newId = Date.now();
-    setSessions(prev => [...prev.map(s => ({ ...s, active: false })), { id: newId, title: "Новый чат", active: true }]);
+    setSessions(prev => [
+      ...prev.map(s => ({ ...s, active: false })),
+      { id: newId, title: "Новый чат", active: true, messages: [], history: [] }
+    ]);
+  };
+
+  const switchSession = (id) => {
+    if (sessions.find(s => s.id === id)?.active) return;
+    abortRef.current?.abort();
+    setAttachedFile(null);
+    setIsTyping(false);
+    setSessions(prev => prev.map(s => ({ ...s, active: s.id === id })));
   };
 
   const handleKey = (e) => {
@@ -471,7 +512,7 @@ export default function XwinAI() {
           </button>
           <div style={{ marginTop: 12, flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: 4 }}>
             {sessions.slice().reverse().map(sess => (
-              <div key={sess.id} className={`sess-item${sess.active ? " active" : ""}`} style={{ padding: "9px 12px", borderRadius: 9, fontSize: 12, color: sess.active ? "#a0c4ff" : "#445577", cursor: "pointer", transition: "all 0.15s", borderLeft: "2px solid transparent", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+              <div key={sess.id} onClick={() => switchSession(sess.id)} className={`sess-item${sess.active ? " active" : ""}`} style={{ padding: "9px 12px", borderRadius: 9, fontSize: 12, color: sess.active ? "#a0c4ff" : "#445577", cursor: "pointer", transition: "all 0.15s", borderLeft: "2px solid transparent", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                 💬 {sess.title}
               </div>
             ))}
