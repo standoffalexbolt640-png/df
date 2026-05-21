@@ -1,14 +1,8 @@
 import { useState, useRef, useEffect } from "react";
 
-// Фронтенд НЕ хранит ключ Anthropic. Он ходит на ваш бэкенд-прокси, а прокси уже
-// добавляет x-api-key и ретранслирует запрос на https://api.anthropic.com/v1/messages.
-// Пример прокси лежит в server/proxy.example.mjs.
-// URL прокси настраивается через env, по умолчанию "/api/chat" (same-origin, удобно для Next.js).
-const PROXY_URL = (() => {
-  try { if (import.meta?.env?.VITE_CHAT_PROXY_URL) return import.meta.env.VITE_CHAT_PROXY_URL; } catch {}
-  try { if (typeof process !== "undefined" && process.env) return process.env.NEXT_PUBLIC_CHAT_PROXY_URL || process.env.REACT_APP_CHAT_PROXY_URL || "/api/chat"; } catch {}
-  return "/api/chat";
-})();
+// Бесплатный AI без ключа — Pollinations.ai (OpenAI-совместимый endpoint, анонимный доступ, SSE-стриминг).
+const API_URL = "https://text.pollinations.ai/openai";
+const MODEL = "openai-fast";
 
 const SYSTEM_PROMPT = `Ты — Xwin Pro, продвинутый AI-ассистент нового поколения. Ты умный, полезный, дружелюбный и точный.
 Отвечай на русском языке если вопрос на русском. Будь конкретным и полезным.
@@ -249,23 +243,13 @@ export default function XwinAI() {
   const buildUserContent = (text, file) => {
     if (!file) return text || "";
 
-    // Изображение — передаём как base64 image
-    if (file.type.startsWith("image/")) {
-      const content = [];
-      content.push({ type: "image", source: { type: "base64", media_type: file.mediaType, data: file.base64 } });
-      content.push({ type: "text", text: text || "Опиши что на изображении подробно" });
-      return content;
+    // Изображение / PDF — модель не поддерживает vision, упоминаем файл текстом
+    if (file.type.startsWith("image/") || file.type === "application/pdf") {
+      const note = `[Прикреплён файл: ${file.name} (${formatFileSize(file.size)})]`;
+      return text ? `${text}\n\n${note}` : note;
     }
 
-    // PDF — передаём как document
-    if (file.type === "application/pdf") {
-      const content = [];
-      content.push({ type: "document", source: { type: "base64", media_type: "application/pdf", data: file.base64 } });
-      content.push({ type: "text", text: text || "Проанализируй этот документ подробно" });
-      return content;
-    }
-
-    // Текстовые файлы и код — декодируем и вставляем в сообщение
+    // Текстовые файлы и код — декодируем UTF-8 и вставляем в сообщение
     try {
       // atob + TextDecoder, чтобы корректно декодировать UTF-8 (кириллица и т.п.)
       const bytes = Uint8Array.from(atob(file.base64), c => c.charCodeAt(0));
@@ -312,18 +296,17 @@ export default function XwinAI() {
     abortRef.current = controller;
 
     try {
-      const response = await fetch(PROXY_URL, {
+      const response = await fetch(API_URL, {
         method: "POST",
         signal: controller.signal,
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          model: "claude-sonnet-4-20250514",
-          max_tokens: 8000,
+          model: MODEL,
           stream: true,
-          system: SYSTEM_PROMPT,
-          messages: newHistory
+          messages: [
+            { role: "system", content: SYSTEM_PROMPT },
+            ...newHistory
+          ]
         })
       });
 
@@ -351,8 +334,9 @@ export default function XwinAI() {
           if (data === "[DONE]") continue;
           try {
             const parsed = JSON.parse(data);
-            if (parsed.type === "content_block_delta" && parsed.delta?.type === "text_delta") {
-              fullReply += parsed.delta.text;
+            const delta = parsed.choices?.[0]?.delta?.content;
+            if (typeof delta === "string" && delta) {
+              fullReply += delta;
               const snapshot = fullReply;
               setMessages(prev => {
                 const updated = [...prev];
@@ -380,8 +364,7 @@ export default function XwinAI() {
       setHistory(h => [...h, { role: "assistant", content: fullReply }]);
 
       if (newHistory.length === 1) {
-        const title = (typeof userContent === "string" ? userContent : msg || currentFile?.name || "Файл")
-          .slice(0, 28);
+        const title = (msg || currentFile?.name || "Файл").slice(0, 28);
         setSessions(s => s.map(sess => sess.active ? { ...sess, title: title + (title.length >= 28 ? "…" : "") } : sess));
       }
     } catch (err) {
